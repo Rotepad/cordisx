@@ -4,6 +4,7 @@ const resumedThreads = new Set()
 reader.on('line', line => {
   const message = JSON.parse(line)
   const threadId = message.params?.threadId
+  if (message.method === 'thread/unsubscribe' && String(threadId).startsWith('lost-lifecycle-')) return
   if (String(threadId).startsWith('unloaded-')) {
     if (message.method === 'thread/read') {
       const active = threadId === 'unloaded-active'
@@ -16,7 +17,15 @@ reader.on('line', line => {
               id: threadId === 'unloaded-wrong-id' ? 'another-thread' : threadId,
               modelProvider: native ? 'openai' : 'provider-b',
               model: 'model-b',
-              status: { type: active ? 'active' : threadId === 'unloaded-unknown' ? 'unknown' : 'notLoaded' },
+              status: {
+                type: active || resumedThreads.has(threadId) && threadId === 'unloaded-changed-before-replay'
+                  ? 'active'
+                  : threadId === 'unloaded-unknown'
+                  ? 'unknown'
+                  : resumedThreads.has(threadId)
+                  ? 'idle'
+                  : 'notLoaded',
+              },
             },
           },
         })

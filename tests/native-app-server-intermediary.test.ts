@@ -623,6 +623,98 @@ describe('native app-server intermediary', () => {
     }
   })
 
+  it.each(['thread/resume', 'thread/unsubscribe', 'turn/addUserMessage', 'turn/steer'])(
+    'rejects %s through the same recovery lane before it reaches the native session',
+    async method => {
+      const h = await harness()
+      let entered!: () => void
+      const ready = new Promise<void>(resolve => {
+        entered = resolve
+      })
+      let release!: () => void
+      const barrier = new Promise<void>(resolve => {
+        release = resolve
+      })
+      const prepare = h.prepareThreadResume.getMockImplementation()!
+      h.prepareThreadResume.mockImplementationOnce(async input => {
+        entered()
+        await barrier
+        return prepare(input)
+      })
+      try {
+        h.send({ id: 'first', method: 'turn/start', params: { threadId: 'unloaded-concurrent' } })
+        await ready
+        h.send({ id: 'mutation', method, params: { threadId: 'unloaded-concurrent', modelProvider: 'other' } })
+        expect(JSON.parse(await h.read())).toMatchObject({ id: 'mutation', error: { code: -32000 } })
+        release()
+        expect(JSON.parse(await h.read())).toMatchObject({ id: 'first', result: { method: 'turn/start' } })
+        expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+      } finally {
+        release()
+        await h.close()
+      }
+    },
+  )
+
+  it('does not replay after the resumed thread becomes active before final validation', async () => {
+    const h = await harness()
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-changed-before-replay' } })
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'turn',
+        error: { message: 'thread not found: unloaded-changed-before-replay' },
+      })
+      expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('continues ordinary native lifecycle and sends when unresolved lifecycle tracking is full', async () => {
+    const h = await harness()
+    try {
+      for (let index = 0; index < 65; index++) {
+        h.send({ id: `lost-${index}`, method: 'thread/unsubscribe', params: { threadId: `lost-lifecycle-${index}` } })
+      }
+      h.send({ id: 'resume', method: 'thread/resume', params: { threadId: 'native-thread' } })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'resume', result: { thread: { id: 'native-thread' } } })
+      h.send({ id: 'send', method: 'turn/start', params: { threadId: 'native-thread' } })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'send', result: { method: 'turn/start' } })
+      expect(h.prepareThreadResume).not.toHaveBeenCalled()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('does not replay cancelled input even when native resume completes successfully', async () => {
+    const h = await harness()
+    let entered!: () => void
+    const ready = new Promise<void>(resolve => {
+      entered = resolve
+    })
+    let release!: () => void
+    const barrier = new Promise<void>(resolve => {
+      release = resolve
+    })
+    const prepare = h.prepareThreadResume.getMockImplementation()!
+    h.prepareThreadResume.mockImplementationOnce(async input => {
+      entered()
+      await barrier
+      return prepare(input)
+    })
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-cancelled' } })
+      await ready
+      h.send({ id: 'cancel', method: 'turn/interrupt', params: { threadId: 'unloaded-cancelled' } })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'cancel', result: { method: 'turn/interrupt' } })
+      release()
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'turn', error: { code: -32600 } })
+    } finally {
+      release()
+      await h.close()
+    }
+  })
+
   it('recovers an unloaded turn through the real Host controller and retains its lease until disposal', async () => {
     const scope = { ...threadScope, threadId: 'unloaded-real-controller' }
     const fixture = submissionHarness({ scope })
