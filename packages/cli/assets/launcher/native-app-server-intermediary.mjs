@@ -29,6 +29,8 @@ const resumeCalls = new NativeRequestTracker()
 const unmarkedTurns = new NativeRequestTracker()
 // An unacknowledged lifecycle mutation stays uncertain; retain its fence, not its payload.
 const lifecycleCalls = new Map()
+// If the bounded map loses a mutation, its safety fence lasts until this process restarts.
+// Ordinary native requests still pass through; only automatic recovery/Host switching stops.
 let lifecycleUncertain = false
 const recoveringTurns = new Set()
 const cancelledRecovery = new Set()

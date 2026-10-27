@@ -5,6 +5,7 @@ reader.on('line', line => {
   const message = JSON.parse(line)
   const threadId = message.params?.threadId
   if (message.method === 'thread/unsubscribe' && String(threadId).startsWith('lost-lifecycle-')) return
+  if (message.method === 'thread/unsubscribe' && threadId === 'unloaded-pending-lifecycle') return
   if (String(threadId).startsWith('unloaded-')) {
     if (message.method === 'thread/read') {
       const active = threadId === 'unloaded-active'

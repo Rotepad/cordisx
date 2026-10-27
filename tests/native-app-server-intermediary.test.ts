@@ -686,6 +686,21 @@ describe('native app-server intermediary', () => {
     }
   })
 
+  it('does not start automatic recovery while a prior native lifecycle request has no acknowledgement', async () => {
+    const h = await harness()
+    try {
+      h.send({ id: 'pending', method: 'thread/unsubscribe', params: { threadId: 'unloaded-pending-lifecycle' } })
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-pending-lifecycle' } })
+      expect(JSON.parse(await h.read())).toEqual({
+        id: 'turn',
+        error: { code: -32600, message: 'thread not found: unloaded-pending-lifecycle' },
+      })
+      expect(h.prepareThreadResume).not.toHaveBeenCalled()
+    } finally {
+      await h.close()
+    }
+  })
+
   it('does not replay cancelled input even when native resume completes successfully', async () => {
     const h = await harness()
     let entered!: () => void
