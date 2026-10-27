@@ -448,6 +448,11 @@ candidate provider table. The candidate lease replaces the thread binding only
 after native resume succeeds; other native errors and failed retries leave the
 existing binding unchanged. When the Host cannot vouch for the provider, the
 native failure stands.
+Recovery restores the persisted provider without preparing a new Send or a
+provider change. It must not add a new-thread first-turn association fence:
+unchanged-provider sends and retries intentionally pass through without an
+operation token. The existing first-turn fence for a managed `thread/start`
+and marked provider-change authorization remain unchanged.
 
 Each successful discovery binds interception to the observed resource SHA-256.
 A resource update between discovery and interception fails closed. The existing

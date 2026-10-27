@@ -287,10 +287,10 @@ async function recoverResume(id, params, providerId, failureLine) {
       succeeded: true,
     })
     if (completed !== true) throw new Error('Managed resume completion rejected')
-    // The recovered native session now carries managed provider configuration.
-    // Keep its next turn fail-closed until the CordisX Send path supplies a
-    // launch-scoped operation token.
-    firstTurns.set(params.threadId, prepared.resumeToken)
+    // Recovery restores the persisted provider; it does not prepare a Send or
+    // provider change. Unchanged-provider sends/retries have no operation token.
+    // Only thread/start creates a first-turn association fence; retain any
+    // existing fence rather than introducing one for a historical thread.
     await write(process.stdout, { id, result })
   } catch {
     // The original native failure stays authoritative whenever the Host cannot vouch for the provider.

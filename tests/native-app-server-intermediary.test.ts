@@ -5,8 +5,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { startNativeSubmissionControlServer } from '../packages/cli/src/launcher/native-submission-control-server.js'
 import type { NativeSubmissionController } from '../packages/cli/src/launcher/native-submission-controller.js'
 import { nextInput, request, responseEvents, responseSse } from './fixtures/deepseek-responses.js'
+import {
+  harness as submissionHarness,
+  threadAction,
+  threadScope,
+} from './fixtures/native-submission-controller-harness.js'
 
-async function harness() {
+async function harness(controller?: NativeSubmissionController) {
   const server = await startNativeSubmissionControlServer()
   const consume = vi.fn(async (input: { operationToken: string }) =>
     input.operationToken === 'rejected-operation-token'
@@ -39,7 +44,7 @@ async function harness() {
   )
   const completeThreadResume = vi.fn(async () => true)
   server.bindController(
-    {
+    controller ?? {
       consumeMarkedRequest: consume,
       authorizeMarkedRequest: authorize,
       completeMarkedRequest: complete,
@@ -347,7 +352,47 @@ describe('native app-server intermediary', () => {
         succeeded: true,
       })
       h.send({ id: 'unmarked-turn', method: 'turn/start', params: { threadId: 'managed-thread' } })
-      expect(JSON.parse(await h.read())).toMatchObject({ id: 'unmarked-turn', error: { code: -32000 } })
+      // No provider change is pending after recovery. Native sends and queued
+      // retries pass through without a new operation token.
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'unmarked-turn',
+        result: { method: 'turn/start', received: { threadId: 'managed-thread' } },
+      })
+      h.send({
+        id: 'retry-turn',
+        method: 'turn/start',
+        params: {
+          threadId: 'managed-thread',
+          model: 'model-b',
+          input: [{ type: 'text', text: 'continue after restart' }],
+          effort: 'high',
+          config: { keep: 1 },
+        },
+      })
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'retry-turn',
+        result: {
+          method: 'turn/start',
+          received: {
+            threadId: 'managed-thread',
+            model: 'model-b',
+            input: [{ type: 'text', text: 'continue after restart' }],
+            effort: 'high',
+            config: { keep: 1 },
+          },
+        },
+      })
+      expect(h.consume).not.toHaveBeenCalled()
+      expect(h.authorize).not.toHaveBeenCalled()
+      h.send({
+        id: 'rejected-turn',
+        method: 'turn/start',
+        params: {
+          threadId: 'managed-thread',
+          config: { 'cordisx.operation_token': 'rejected-operation-token' },
+        },
+      })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'rejected-turn', error: { code: -32000 } })
       h.send({
         id: 'marked-turn',
         method: 'turn/start',
@@ -359,6 +404,39 @@ describe('native app-server intermediary', () => {
       expect(JSON.parse(await h.read())).toMatchObject({ id: 'marked-turn', result: { method: 'turn/start' } })
     } finally {
       await h.close()
+    }
+  })
+
+  it('forwards the real controller pass-through Send after committing a recovered provider lease', async () => {
+    const scope = { ...threadScope, threadId: 'managed-thread' }
+    const fixture = submissionHarness({ scope })
+    fixture.setSnapshot({ revision: 4, effective: { providerId: 'provider-b', model: 'model-b' } })
+    const h = await harness(fixture.controller)
+    try {
+      h.send({ id: 'resume', method: 'thread/resume', params: { threadId: scope.threadId } })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'resume', result: { thread: { id: scope.threadId } } })
+      expect(fixture.prepare).toHaveBeenCalledOnce()
+      const params = {
+        threadId: scope.threadId,
+        model: 'model-b',
+        input: [{ type: 'text', text: 'unchanged-provider follow-up' }],
+        effort: 'high',
+        config: { keep: 1 },
+      }
+      for (const intent of ['ordinary-send', 'edit-retry', 'queue'] as const) {
+        expect(await fixture.controller.prepareSubmission(scope, { ...threadAction, threadId: scope.threadId, intent }))
+          .toEqual({ kind: 'pass-through' })
+        h.send({ id: intent, method: 'turn/start', params })
+        const response = JSON.parse(await h.read())
+        expect(response).toMatchObject({ id: intent, result: { method: 'turn/start' } })
+        expect(response.result.received).toEqual(params)
+      }
+      expect(fixture.switchThread).not.toHaveBeenCalled()
+      expect(fixture.disposed).toEqual([])
+    } finally {
+      await h.close()
+      await fixture.controller.dispose()
+      expect(fixture.disposed).toEqual(['provider-b-1'])
     }
   })
 
