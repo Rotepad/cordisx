@@ -55,7 +55,7 @@ type NativeSubmissionActivation =
 const execFileAsync = promisify(execFile)
 const NATIVE_SUBMISSION_CACHE_SCHEMA = 1
 /** Bump whenever structural discovery or its generated transform contract changes. */
-const NATIVE_SUBMISSION_ANALYZER_VERSION = 4
+const NATIVE_SUBMISSION_ANALYZER_VERSION = 5
 const SHA256 = /^[a-f0-9]{64}$/u
 
 interface CachedNativeTransform {
@@ -309,14 +309,19 @@ async function nativeSubmissionTransforms(contents: string, cacheDirectory: stri
   }
   const discovered = nativeSubmissionTransformAnalysisForApp(identity.appVersion, identity.buildNumber, resources)
   const captured = captureTransforms(discovered.transforms, resources)
-  const initial = resources.find(resource => resource.url.includes('/app-initial-'))!
-  let accountCapability: NativeAccountCapabilityDescriptor | undefined
-  try {
-    const syntax = 'syntaxByResource' in discovered ? discovered.syntaxByResource.get(initial) : undefined
-    accountCapability = syntax === undefined
-      ? discoverNativeAccountCapability(initial)
-      : discoverNativeAccountCapabilityFromSyntax(initial, syntax)
-  } catch { /* Account admission reports its own unavailable capability. */ }
+  const accounts = resources.flatMap(resource => {
+    try {
+      const syntax = 'syntaxByResource' in discovered ? discovered.syntaxByResource.get(resource) : undefined
+      return [
+        syntax === undefined
+          ? discoverNativeAccountCapability(resource)
+          : discoverNativeAccountCapabilityFromSyntax(resource, syntax),
+      ]
+    } catch {
+      return [] /* Account admission reports its own unavailable capability. */
+    }
+  })
+  const accountCapability = accounts.length === 1 ? accounts[0] : undefined
   const analysis: NativeSubmissionAnalysisCache = {
     schemaVersion: NATIVE_SUBMISSION_CACHE_SCHEMA,
     analyzerVersion: NATIVE_SUBMISSION_ANALYZER_VERSION,
@@ -434,7 +439,10 @@ export async function prepareNativeSubmissionBootstrap(
             options.cacheDirectory ?? defaultNativeSubmissionCacheDirectory(),
           ))
         } catch (error) {
-          throw new NativeSubmissionCompatibilityError(error)
+          // Catalog/configuration and credential delivery do not depend on rewriting
+          // the native submit function. Preserve them while disabling only takeover.
+          console.warn(`[cordisx] enhanced native model switching unavailable: ${String(error)}`)
+          discovered = { transforms: [] }
         }
         reportStage('native-submission-resource-analysis-ready')
         if (closePromise !== undefined) throw new Error('Native submission bootstrap was closed')
@@ -627,6 +635,7 @@ export async function prepareNativeSubmissionBootstrap(
           pluginCatalog = nativeModelProviderCatalog(activation, completeOptions.selectorIcons)
         }
         const cdp = createNativeSubmissionCdpAuthority({
+          submissionAvailable: discovered.transforms.length > 0,
           catalogSubscribe: (listener: () => void) => {
             const subscriptions = [
               nativeManagement!.subscribe(listener),
