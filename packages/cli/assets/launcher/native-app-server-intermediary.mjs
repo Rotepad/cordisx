@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process'
 import net from 'node:net'
+import { NativeRequestTracker } from './native-request-tracker.mjs'
 
 const socketPath = process.env.CORDISX_NATIVE_CONTROL_SOCKET
 const nonce = process.env.CORDISX_NATIVE_CONTROL_NONCE
@@ -24,7 +25,15 @@ const control = net.connect(socketPath)
 const controlCalls = new Map()
 const privateCalls = new Map()
 const desktopCalls = new Map()
-const resumeCalls = new Map()
+const resumeCalls = new NativeRequestTracker()
+const unmarkedTurns = new NativeRequestTracker()
+// An unacknowledged lifecycle mutation stays uncertain; retain its fence, not its payload.
+const lifecycleCalls = new Map()
+// If the bounded map loses a mutation, its safety fence lasts until this process restarts.
+// Ordinary native requests still pass through; only automatic recovery/Host switching stops.
+let lifecycleUncertain = false
+const recoveringTurns = new Set()
+const cancelledRecovery = new Set()
 const firstTurns = new Map()
 const privatePrefix = `cordisx-private-${nonce}-`
 let sequence = 0
@@ -32,6 +41,7 @@ let closed = false
 let inputQueue = Promise.resolve()
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value) ? value : undefined
 const validToken = value => typeof value === 'string' && /^[^\0\r\n]{16,256}$/u.test(value)
+const lifecyclePending = threadId => lifecycleUncertain || [...lifecycleCalls.values()].includes(threadId)
 const write = (stream, value) =>
   new Promise((resolve, reject) => {
     if (stream.destroyed) {
@@ -59,6 +69,10 @@ function stop(reason = 'transport-closed') {
   rejectAll(privateCalls)
   desktopCalls.clear()
   resumeCalls.clear()
+  unmarkedTurns.clear()
+  recoveringTurns.clear()
+  cancelledRecovery.clear()
+  lifecycleCalls.clear()
   firstTurns.clear()
   control.destroy()
   process.stdin.destroy()
@@ -94,7 +108,9 @@ function settle(calls, message, isControl) {
   clearTimeout(pending.timer)
   const failed = isControl ? message.ok !== true : message.error !== undefined
   failed
-    ? pending.reject(new Error('Native request rejected'))
+    ? pending.reject(
+      Object.assign(new Error('Native request rejected'), isControl ? {} : { nativeError: message.error }),
+    )
     : pending.resolve(isControl ? message.value : message.result)
   return true
 }
@@ -170,6 +186,21 @@ async function forward(line) {
   const params = object(message?.params)
   const config = object(params?.config)
   const managed = config !== undefined && Object.hasOwn(config, marker)
+  if (message?.method === 'turn/interrupt' && typeof params?.threadId === 'string') {
+    unmarkedTurns.retireThread(params.threadId)
+    if (recoveringTurns.has(params.threadId)) cancelledRecovery.add(params.threadId)
+  }
+  const mutatesThread = ['turn/start', 'turn/addUserMessage', 'turn/steer', 'thread/resume', 'thread/unsubscribe']
+    .includes(message?.method)
+  if (
+    mutatesThread && (recoveringTurns.has(params?.threadId) || switching.has(params?.threadId))
+  ) {
+    await write(process.stdout, {
+      id: message.id,
+      error: { code: -32000, message: 'Thread recovery is in progress. Wait before sending another message.' },
+    })
+    return
+  }
   if (!managed) {
     if (message?.method === 'turn/start' && firstTurns.has(params?.threadId)) {
       await write(process.stdout, {
@@ -184,8 +215,22 @@ async function forward(line) {
     if (typeof message?.id === 'string' && message.id.startsWith(privatePrefix)) throw new Error('Reserved request id')
     if (
       message?.method === 'thread/resume' && typeof params?.threadId === 'string'
-      && ['string', 'number'].includes(typeof message.id) && resumeCalls.size < 64
-    ) resumeCalls.set(message.id, params)
+      && ['string', 'number'].includes(typeof message.id)
+    ) resumeCalls.track(message.id, params)
+    if (
+      message?.method === 'turn/start' && typeof params?.threadId === 'string'
+      && ['string', 'number'].includes(typeof message.id)
+    ) unmarkedTurns.track(message.id, params)
+    if (
+      ['thread/resume', 'thread/unsubscribe'].includes(message?.method)
+      && typeof params?.threadId === 'string' && ['string', 'number'].includes(typeof message.id)
+    ) {
+      if (lifecycleCalls.size >= 64 || lifecycleCalls.has(message.id)) {
+        // Continue the native request; uncertain correlation disables only automatic recovery/switching.
+        lifecycleUncertain = true
+      } else lifecycleCalls.set(message.id, params.threadId)
+      if (message.method === 'thread/unsubscribe') unmarkedTurns.retireThread(params.threadId)
+    }
     await write(child.stdin, line)
     return
   }
@@ -256,6 +301,14 @@ async function forward(line) {
 
 // A restarted app-server no longer knows a launch-scoped managed provider that a persisted thread still names.
 async function recoverResume(id, params, providerId, failureLine) {
+  if (
+    recoveringTurns.has(params.threadId) || switching.has(params.threadId)
+    || lifecyclePending(params.threadId)
+  ) {
+    await write(process.stdout, failureLine)
+    return
+  }
+  recoveringTurns.add(params.threadId)
   try {
     const read = await nativeCall('thread/read', { threadId: params.threadId, includeTurns: false })
     const persistedProviderId = read?.thread?.modelProvider
@@ -287,14 +340,97 @@ async function recoverResume(id, params, providerId, failureLine) {
       succeeded: true,
     })
     if (completed !== true) throw new Error('Managed resume completion rejected')
-    // The recovered native session now carries managed provider configuration.
-    // Keep its next turn fail-closed until the CordisX Send path supplies a
-    // launch-scoped operation token.
-    firstTurns.set(params.threadId, prepared.resumeToken)
+    // Recovery restores the persisted provider; it does not prepare a Send or
+    // provider change. Unchanged-provider sends/retries have no operation token.
+    // Only thread/start creates a first-turn association fence; retain any
+    // existing fence rather than introducing one for a historical thread.
     await write(process.stdout, { id, result })
   } catch {
     // The original native failure stays authoritative whenever the Host cannot vouch for the provider.
     await write(process.stdout, failureLine)
+  } finally {
+    recoveringTurns.delete(params.threadId)
+    cancelledRecovery.delete(params.threadId)
+  }
+}
+
+// A persisted history can exist after its executable session has been unloaded.
+// Replay only the exact missing-thread rejection, never a timeout or failed turn.
+async function recoverUnloadedTurn(id, params, failureLine) {
+  const threadId = params.threadId
+  if (recoveringTurns.has(threadId) || switching.has(threadId) || lifecyclePending(threadId)) {
+    await write(process.stdout, failureLine)
+    return
+  }
+  recoveringTurns.add(threadId)
+  let resumeToken
+  let committed = false
+  let replayAttempted = false
+  try {
+    const read = await nativeCall('thread/read', { threadId, includeTurns: false })
+    const thread = object(read?.thread)
+    if (
+      thread?.id !== threadId || thread.status?.type !== 'notLoaded'
+      || typeof thread.modelProvider !== 'string' || thread.modelProvider === 'openai'
+      || typeof thread.model !== 'string' || thread.model === ''
+    ) throw new Error('Missing thread is not an unloaded managed session')
+    const prepared = await controlCall('resume', {
+      threadId,
+      providerId: thread.modelProvider,
+      model: thread.model,
+    })
+    if (prepared?.kind !== 'resume' || !validToken(prepared.resumeToken) || !object(prepared.configOverrides)) {
+      throw new Error('Managed recovery rejected')
+    }
+    resumeToken = prepared.resumeToken
+    const resumed = await nativeCall('thread/resume', {
+      threadId,
+      modelProvider: thread.modelProvider,
+      model: thread.model,
+      config: prepared.configOverrides,
+      excludeTurns: true,
+    })
+    if (
+      resumed?.thread?.id !== threadId || resumed.modelProvider !== thread.modelProvider
+      || resumed.model !== thread.model || resumed.thread.status?.type !== 'idle'
+    ) throw new Error('Recovery did not acknowledge the same idle thread and provider')
+    committed = await controlCall('resume-complete', { threadId, resumeToken, succeeded: true }) === true
+    if (!committed) throw new Error('Managed recovery completion rejected')
+    const current = await nativeCall('thread/read', { threadId, includeTurns: false })
+    if (
+      cancelledRecovery.has(threadId) || current?.thread?.id !== threadId
+      || current.thread.status?.type !== 'idle' || current.thread.modelProvider !== thread.modelProvider
+      || current.thread.model !== thread.model
+    ) {
+      throw new Error('Recovered thread changed before replay')
+    }
+    // The replay uses a private id but preserves all original parameters and
+    // native permission checks. Its result is delivered once under the original id.
+    replayAttempted = true
+    const result = await nativeCall('turn/start', params)
+    await write(process.stdout, { id, result })
+  } catch (error) {
+    if (resumeToken !== undefined && !committed) {
+      await controlCall('resume-complete', { threadId, resumeToken, succeeded: false }).catch(() => undefined)
+    }
+    // Once replay was attempted, the original missing-thread failure is no
+    // longer authoritative. Preserve a native rejection or report uncertainty
+    // rather than falsely telling Desktop that the message was never sent.
+    await write(
+      process.stdout,
+      replayAttempted
+        ? {
+          id,
+          error: error.nativeError ?? {
+            code: -32000,
+            message: 'Recovered turn result is unknown. Check thread history before retrying.',
+          },
+        }
+        : failureLine,
+    )
+  } finally {
+    recoveringTurns.delete(threadId)
+    cancelledRecovery.delete(threadId)
   }
 }
 
@@ -319,9 +455,16 @@ readLines(child.stdout, line => {
   if (settle(privateCalls, message, false)) return
   // Late private responses must never escape into the Desktop's request table.
   if (typeof message?.id === 'string' && message.id.startsWith(privatePrefix)) return
-  const resumeParams = message.method === undefined ? resumeCalls.get(message?.id) : undefined
+  if (message.method === undefined) lifecycleCalls.delete(message.id)
+  const turnParams = message.method === undefined ? unmarkedTurns.take(message.id) : undefined
+  if (turnParams !== undefined) {
+    if (message.error?.code === -32600 && message.error.message === `thread not found: ${turnParams.threadId}`) {
+      void recoverUnloadedTurn(message.id, turnParams, line).catch(stop)
+      return
+    }
+  }
+  const resumeParams = message.method === undefined ? resumeCalls.take(message?.id) : undefined
   if (resumeParams !== undefined) {
-    resumeCalls.delete(message.id)
     const providerId = missingManagedProvider(message)
     if (providerId !== undefined) {
       void recoverResume(message.id, resumeParams, providerId, line).catch(stop)
@@ -368,7 +511,11 @@ readLines(control, line => {
     }).catch(() => write(control, { id: message.id, ok: false }).catch(stop))
     return
   }
-  if (message.type !== 'switch' || typeof message.id !== 'string' || switching.has(message.threadId)) {
+  if (
+    message.type !== 'switch' || typeof message.id !== 'string'
+    || switching.has(message.threadId) || recoveringTurns.has(message.threadId)
+    || lifecyclePending(message.threadId)
+  ) {
     if (message.type === 'switch') void write(control, { id: message.id, ok: false }).catch(stop)
     return
   }

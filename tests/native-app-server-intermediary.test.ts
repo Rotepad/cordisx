@@ -5,8 +5,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { startNativeSubmissionControlServer } from '../packages/cli/src/launcher/native-submission-control-server.js'
 import type { NativeSubmissionController } from '../packages/cli/src/launcher/native-submission-controller.js'
 import { nextInput, request, responseEvents, responseSse } from './fixtures/deepseek-responses.js'
+import {
+  harness as submissionHarness,
+  threadAction,
+  threadScope,
+} from './fixtures/native-submission-controller-harness.js'
 
-async function harness() {
+async function harness(controller?: NativeSubmissionController) {
   const server = await startNativeSubmissionControlServer()
   const consume = vi.fn(async (input: { operationToken: string }) =>
     input.operationToken === 'rejected-operation-token'
@@ -39,7 +44,7 @@ async function harness() {
   )
   const completeThreadResume = vi.fn(async () => true)
   server.bindController(
-    {
+    controller ?? {
       consumeMarkedRequest: consume,
       authorizeMarkedRequest: authorize,
       completeMarkedRequest: complete,
@@ -347,7 +352,47 @@ describe('native app-server intermediary', () => {
         succeeded: true,
       })
       h.send({ id: 'unmarked-turn', method: 'turn/start', params: { threadId: 'managed-thread' } })
-      expect(JSON.parse(await h.read())).toMatchObject({ id: 'unmarked-turn', error: { code: -32000 } })
+      // No provider change is pending after recovery. Native sends and queued
+      // retries pass through without a new operation token.
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'unmarked-turn',
+        result: { method: 'turn/start', received: { threadId: 'managed-thread' } },
+      })
+      h.send({
+        id: 'retry-turn',
+        method: 'turn/start',
+        params: {
+          threadId: 'managed-thread',
+          model: 'model-b',
+          input: [{ type: 'text', text: 'continue after restart' }],
+          effort: 'high',
+          config: { keep: 1 },
+        },
+      })
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'retry-turn',
+        result: {
+          method: 'turn/start',
+          received: {
+            threadId: 'managed-thread',
+            model: 'model-b',
+            input: [{ type: 'text', text: 'continue after restart' }],
+            effort: 'high',
+            config: { keep: 1 },
+          },
+        },
+      })
+      expect(h.consume).not.toHaveBeenCalled()
+      expect(h.authorize).not.toHaveBeenCalled()
+      h.send({
+        id: 'rejected-turn',
+        method: 'turn/start',
+        params: {
+          threadId: 'managed-thread',
+          config: { 'cordisx.operation_token': 'rejected-operation-token' },
+        },
+      })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'rejected-turn', error: { code: -32000 } })
       h.send({
         id: 'marked-turn',
         method: 'turn/start',
@@ -359,6 +404,351 @@ describe('native app-server intermediary', () => {
       expect(JSON.parse(await h.read())).toMatchObject({ id: 'marked-turn', result: { method: 'turn/start' } })
     } finally {
       await h.close()
+    }
+  })
+
+  it('forwards the real controller pass-through Send after committing a recovered provider lease', async () => {
+    const scope = { ...threadScope, threadId: 'managed-thread' }
+    const fixture = submissionHarness({ scope })
+    fixture.setSnapshot({ revision: 4, effective: { providerId: 'provider-b', model: 'model-b' } })
+    const h = await harness(fixture.controller)
+    try {
+      h.send({ id: 'resume', method: 'thread/resume', params: { threadId: scope.threadId } })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'resume', result: { thread: { id: scope.threadId } } })
+      expect(fixture.prepare).toHaveBeenCalledOnce()
+      const params = {
+        threadId: scope.threadId,
+        model: 'model-b',
+        input: [{ type: 'text', text: 'unchanged-provider follow-up' }],
+        effort: 'high',
+        config: { keep: 1 },
+      }
+      for (const intent of ['ordinary-send', 'edit-retry', 'queue'] as const) {
+        expect(await fixture.controller.prepareSubmission(scope, { ...threadAction, threadId: scope.threadId, intent }))
+          .toEqual({ kind: 'pass-through' })
+        h.send({ id: intent, method: 'turn/start', params })
+        const response = JSON.parse(await h.read())
+        expect(response).toMatchObject({ id: intent, result: { method: 'turn/start' } })
+        expect(response.result.received).toEqual(params)
+      }
+      expect(fixture.switchThread).not.toHaveBeenCalled()
+      expect(fixture.disposed).toEqual([])
+    } finally {
+      await h.close()
+      await fixture.controller.dispose()
+      expect(fixture.disposed).toEqual(['provider-b-1'])
+    }
+  })
+
+  it('recovers an unloaded managed thread once and preserves the exact original turn controls', async () => {
+    const h = await harness()
+    const params = {
+      threadId: 'unloaded-managed',
+      model: 'model-b',
+      effort: 'high',
+      input: [{ type: 'text', text: 'continue the same thread' }],
+      approvalPolicy: 'on-request',
+      sandboxPolicy: { type: 'readOnly' },
+      config: { keep: 1 },
+      collaborationMode: { mode: 'plan', settings: { model: 'model-b' } },
+    }
+    try {
+      h.send({ id: 'original-turn', method: 'turn/start', params })
+      const response = JSON.parse(await h.read())
+      expect(response).toMatchObject({ id: 'original-turn', result: { method: 'turn/start' } })
+      expect(response.result.received).toEqual(params)
+      expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+      expect(h.prepareThreadResume).toHaveBeenCalledWith({
+        threadId: params.threadId,
+        providerId: 'provider-b',
+        model: 'model-b',
+      })
+      expect(h.completeThreadResume).toHaveBeenCalledWith({
+        threadId: params.threadId,
+        resumeToken: `resume-token-${params.threadId}`,
+        succeeded: true,
+      })
+      h.send({ id: 'next-turn', method: 'turn/start', params })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'next-turn', result: { method: 'turn/start' } })
+      expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it.each(['unloaded-active', 'unloaded-native', 'unloaded-wrong-id', 'unloaded-unknown'])(
+    'does not resume a missing-turn request for %s',
+    async threadId => {
+      const h = await harness()
+      try {
+        h.send({ id: 'turn', method: 'turn/start', params: { threadId } })
+        expect(JSON.parse(await h.read())).toEqual({
+          id: 'turn',
+          error: { code: -32600, message: `thread not found: ${threadId}` },
+        })
+        expect(h.prepareThreadResume).not.toHaveBeenCalled()
+      } finally {
+        await h.close()
+      }
+    },
+  )
+
+  it('keeps the original error and aborts the candidate lease when unloaded recovery fails', async () => {
+    const h = await harness()
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-resume-fails' } })
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'turn',
+        error: { message: 'thread not found: unloaded-resume-fails' },
+      })
+      expect(h.completeThreadResume).toHaveBeenCalledWith({
+        threadId: 'unloaded-resume-fails',
+        resumeToken: 'resume-token-unloaded-resume-fails',
+        succeeded: false,
+      })
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('does not loop when the one replay still reports a missing thread', async () => {
+    const h = await harness()
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-retry-fails' } })
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'turn',
+        error: { message: 'thread not found: unloaded-retry-fails' },
+      })
+      expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it.each(['unloaded-provider-mismatch', 'unloaded-resume-active'])(
+    'aborts recovery when resume does not acknowledge the same idle provider: %s',
+    async threadId => {
+      const h = await harness()
+      try {
+        h.send({ id: 'turn', method: 'turn/start', params: { threadId } })
+        expect(JSON.parse(await h.read())).toMatchObject({
+          id: 'turn',
+          error: { message: `thread not found: ${threadId}` },
+        })
+        expect(h.completeThreadResume).toHaveBeenCalledWith({
+          threadId,
+          resumeToken: `resume-token-${threadId}`,
+          succeeded: false,
+        })
+      } finally {
+        await h.close()
+      }
+    },
+  )
+
+  it.each(
+    [
+      ['unloaded-wrong-error-id', -32600, 'thread not found: another-thread'],
+      ['unloaded-wrong-error-code', -32001, 'thread not found: unloaded-wrong-error-code'],
+    ] as const,
+  )('does not recover an unrelated rejection: %s', async (threadId, code, message) => {
+    const h = await harness()
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId } })
+      expect(JSON.parse(await h.read())).toEqual({ id: 'turn', error: { code, message } })
+      expect(h.prepareThreadResume).not.toHaveBeenCalled()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('returns the replay rejection rather than the obsolete initial missing-thread error', async () => {
+    const h = await harness()
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-replay-denied' } })
+      expect(JSON.parse(await h.read())).toEqual({
+        id: 'turn',
+        error: { code: -32001, message: 'replay permission denied' },
+      })
+      expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('reports an untrustworthy replay result as unknown instead of saying the original was not sent', async () => {
+    const h = await harness()
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-replay-unknown' } })
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'turn',
+        error: { message: 'Recovered turn result is unknown. Check thread history before retrying.' },
+      })
+      expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('rejects another Send while the same thread recovery is pending', async () => {
+    const h = await harness()
+    let ready!: () => void
+    const preparing = new Promise<void>(resolve => {
+      ready = resolve
+    })
+    const originalPrepare = h.prepareThreadResume.getMockImplementation()!
+    let finish!: () => void
+    const barrier = new Promise<void>(resolve => {
+      finish = resolve
+    })
+    h.prepareThreadResume.mockImplementationOnce(async input => {
+      ready()
+      await barrier
+      return await originalPrepare(input)
+    })
+    try {
+      h.send({ id: 'first', method: 'turn/start', params: { threadId: 'unloaded-concurrent' } })
+      await preparing
+      h.send({ id: 'second', method: 'turn/start', params: { threadId: 'unloaded-concurrent' } })
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'second',
+        error: { message: 'Thread recovery is in progress. Wait before sending another message.' },
+      })
+      finish()
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'first', result: { method: 'turn/start' } })
+      expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+    } finally {
+      finish()
+      await h.close()
+    }
+  })
+
+  it.each(['thread/resume', 'thread/unsubscribe', 'turn/addUserMessage', 'turn/steer'])(
+    'rejects %s through the same recovery lane before it reaches the native session',
+    async method => {
+      const h = await harness()
+      let entered!: () => void
+      const ready = new Promise<void>(resolve => {
+        entered = resolve
+      })
+      let release!: () => void
+      const barrier = new Promise<void>(resolve => {
+        release = resolve
+      })
+      const prepare = h.prepareThreadResume.getMockImplementation()!
+      h.prepareThreadResume.mockImplementationOnce(async input => {
+        entered()
+        await barrier
+        return prepare(input)
+      })
+      try {
+        h.send({ id: 'first', method: 'turn/start', params: { threadId: 'unloaded-concurrent' } })
+        await ready
+        h.send({ id: 'mutation', method, params: { threadId: 'unloaded-concurrent', modelProvider: 'other' } })
+        expect(JSON.parse(await h.read())).toMatchObject({ id: 'mutation', error: { code: -32000 } })
+        release()
+        expect(JSON.parse(await h.read())).toMatchObject({ id: 'first', result: { method: 'turn/start' } })
+        expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+      } finally {
+        release()
+        await h.close()
+      }
+    },
+  )
+
+  it('does not replay after the resumed thread becomes active before final validation', async () => {
+    const h = await harness()
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-changed-before-replay' } })
+      expect(JSON.parse(await h.read())).toMatchObject({
+        id: 'turn',
+        error: { message: 'thread not found: unloaded-changed-before-replay' },
+      })
+      expect(h.prepareThreadResume).toHaveBeenCalledOnce()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('continues ordinary native lifecycle and sends when unresolved lifecycle tracking is full', async () => {
+    const h = await harness()
+    try {
+      for (let index = 0; index < 65; index++) {
+        h.send({ id: `lost-${index}`, method: 'thread/unsubscribe', params: { threadId: `lost-lifecycle-${index}` } })
+      }
+      h.send({ id: 'resume', method: 'thread/resume', params: { threadId: 'native-thread' } })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'resume', result: { thread: { id: 'native-thread' } } })
+      h.send({ id: 'send', method: 'turn/start', params: { threadId: 'native-thread' } })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'send', result: { method: 'turn/start' } })
+      expect(h.prepareThreadResume).not.toHaveBeenCalled()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('does not start automatic recovery while a prior native lifecycle request has no acknowledgement', async () => {
+    const h = await harness()
+    try {
+      h.send({ id: 'pending', method: 'thread/unsubscribe', params: { threadId: 'unloaded-pending-lifecycle' } })
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-pending-lifecycle' } })
+      expect(JSON.parse(await h.read())).toEqual({
+        id: 'turn',
+        error: { code: -32600, message: 'thread not found: unloaded-pending-lifecycle' },
+      })
+      expect(h.prepareThreadResume).not.toHaveBeenCalled()
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('does not replay cancelled input even when native resume completes successfully', async () => {
+    const h = await harness()
+    let entered!: () => void
+    const ready = new Promise<void>(resolve => {
+      entered = resolve
+    })
+    let release!: () => void
+    const barrier = new Promise<void>(resolve => {
+      release = resolve
+    })
+    const prepare = h.prepareThreadResume.getMockImplementation()!
+    h.prepareThreadResume.mockImplementationOnce(async input => {
+      entered()
+      await barrier
+      return prepare(input)
+    })
+    try {
+      h.send({ id: 'turn', method: 'turn/start', params: { threadId: 'unloaded-cancelled' } })
+      await ready
+      h.send({ id: 'cancel', method: 'turn/interrupt', params: { threadId: 'unloaded-cancelled' } })
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'cancel', result: { method: 'turn/interrupt' } })
+      release()
+      expect(JSON.parse(await h.read())).toMatchObject({ id: 'turn', error: { code: -32600 } })
+    } finally {
+      release()
+      await h.close()
+    }
+  })
+
+  it('recovers an unloaded turn through the real Host controller and retains its lease until disposal', async () => {
+    const scope = { ...threadScope, threadId: 'unloaded-real-controller' }
+    const fixture = submissionHarness({ scope })
+    fixture.setSnapshot({ revision: 4, effective: { providerId: 'provider-b', model: 'model-b' } })
+    const h = await harness(fixture.controller)
+    try {
+      expect(await fixture.controller.prepareSubmission(scope, { ...threadAction, threadId: scope.threadId }))
+        .toEqual({ kind: 'pass-through' })
+      const params = { threadId: scope.threadId, model: 'model-b', input: [{ type: 'text', text: 'resume' }] }
+      h.send({ id: 'original', method: 'turn/start', params })
+      const result = JSON.parse(await h.read())
+      expect(result).toMatchObject({ id: 'original', result: { method: 'turn/start' } })
+      expect(result.result.received).toEqual(params)
+      expect(fixture.prepare).toHaveBeenCalledOnce()
+      expect(fixture.disposed).toEqual([])
+    } finally {
+      await h.close()
+      await fixture.controller.dispose()
+      expect(fixture.disposed).toEqual(['provider-b-1'])
     }
   })
 

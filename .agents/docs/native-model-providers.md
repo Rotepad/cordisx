@@ -448,6 +448,26 @@ candidate provider table. The candidate lease replaces the thread binding only
 after native resume succeeds; other native errors and failed retries leave the
 existing binding unchanged. When the Host cannot vouch for the provider, the
 native failure stands.
+Recovery restores the persisted provider without preparing a new Send or a
+provider change. It must not add a new-thread first-turn association fence:
+unchanged-provider sends and retries intentionally pass through without an
+operation token. The existing first-turn fence for a managed `thread/start`
+and marked provider-change authorization remain unchanged.
+
+An unmarked `turn/start` can also receive the exact native `thread not found:
+<requested-id>` rejection after its executable session is unloaded while its
+history remains persisted. The intermediary may recover only that rejection:
+it reads the same persisted thread, requires `notLoaded` status and a non-OpenAI
+provider admitted by the Host, and resumes with a candidate provider table.
+Only an acknowledgement of the same idle thread, provider and model commits
+the lease. It replays the original turn parameters once through native
+permission checks and returns the result under the original request id.
+Concurrent sends during recovery are rejected. Marked sends, unrelated native
+errors, active/unknown states, identity mismatches and recovery failures are
+not replayed. A replay rejection remains authoritative; an uncertain replay
+result tells the user to check history rather than claiming nothing was sent.
+This recovery does not establish why the original executable session unloaded,
+and process-fixture evidence is not real Desktop acceptance.
 
 Each successful discovery binds interception to the observed resource SHA-256.
 A resource update between discovery and interception fails closed. The existing
